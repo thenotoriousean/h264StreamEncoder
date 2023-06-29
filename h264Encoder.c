@@ -19,14 +19,10 @@ static const Bool True = 1;
 #endif
 
 // Command line parameters
-static char *infile = NULL;
 static int width = 0;
 static int height = 0;
-static char *outfile = NULL;
-static int quality = 60;
 
 // Buffer for incoming data (FullHD is max, you can increase it as you need)
-//static char rawdata[1920 * 1080 * 3];
 static unsigned char* rawdata;
 static unsigned char* pRet;
 static int pSize;
@@ -42,17 +38,12 @@ static GstElement *pipeline, *vidconv, *x264enc, *qtmux;
 static guint bus_watch_id;
 static GMainLoop *loop;
 
-//new
 static long idx;
 static Bool new_sample;
 static pthread_mutex_t sample_mutex;
 static pthread_cond_t sample_cond;
 static int out_num = 1;
 static int time_out_count = 0;
-
-static int t[300];
-static int i=0;
-static int j=0;
 
 unsigned int MyGetTickCount() {
   struct timeval tim;
@@ -64,12 +55,10 @@ unsigned int MyGetTickCount() {
 // Puts raw data for encoding into gstreamer. Must put exactly width*height bytes.
 void PushBuffer() {
 
-  t[i++] = MyGetTickCount();
-  //printf("push buffer! %d\n",idx);
   GstFlowReturn ret;
   GstBuffer *buffer;
 
-  int size = width * height *4;
+  int size = width * height *3;
   buffer = gst_buffer_new_allocate(NULL, size, NULL);
 
   GstMapInfo info;
@@ -78,11 +67,6 @@ void PushBuffer() {
   memmove(buf, rawdata, size);
   gst_buffer_unmap(buffer, &info);
 
-  //GstClockTime current_time = gst_clock_get_time (gst_system_clock_obtain());
-
-  // 设置视频帧的 PTS 和 DTS
-  // GST_BUFFER_PTS(buffer) = current_time;
-  // GST_BUFFER_DTS(buffer) = current_time;
   GST_BUFFER_DTS(buffer) = GST_BUFFER_PTS(buffer) = idx * 33333333;
   idx++;
 
@@ -93,7 +77,7 @@ void PushStaticImg(){
   fwrite(pRet, 1, pSize, of);
 }
 
-// Reads compressed jpeg frame. Will block if there is nothing to read out.
+// Reads compressed data. Will wait if there is nothing to read out.
 void *PullBuffer() {
   
   unsigned long ms_to_wait=1000*1000;
@@ -119,38 +103,29 @@ void *PullBuffer() {
         break;
       case ETIMEDOUT: //timeout is ocured
         //printf("time out !\n");
-        ms_to_wait=1000*1000;
+        ms_to_wait=1000 / 30;
         PushStaticImg();
         time_out_count++;
-        if(time_out_count == 150){
+        if(time_out_count == 300){
           gst_app_src_end_of_stream(GST_APP_SRC(appsrc));
           printf("end of stream~~~~~~\n");
           pthread_exit(0);
         }
-        //ms_to_wait=20000000;
-        //pthread_exit(0);
         break;
       default:
-        //printf("Error is occured in pthread_cond_timedwait\n");
-        ms_to_wait=1000*1000; //reset timer
+        ms_to_wait=1000 / 30; //reset timer
         break;
     }
   }
   new_sample = FALSE;
   pthread_mutex_unlock(&sample_mutex);
 
-  //printf("pull buffer!!! %d\n", out_num++);
+  printf("pull buffer!!! %d\n", out_num++);
   GstSample *sample;
   g_signal_emit_by_name(appsink, "pull-sample", &sample);
-  //sample = gst_base_sink_get_last_sample(GST_BASE_SINK(appsink));
-
-  // Will block until sample is ready. In our case "sample" is encoded picture.
-  //GstSample *sample = gst_app_sink_pull_sample(GST_APP_SINK(appsink));
 
   if (sample == NULL) {
     fprintf(stderr, "gst_app_sink_pull_sample returned null\n");
-    // Tell Gstreamer thread to stop, pushing EOS into gstreamer
-    //gst_app_src_end_of_stream(GST_APP_SRC(appsrc));
     continue;
   }
 
@@ -160,7 +135,6 @@ void *PullBuffer() {
   gst_buffer_map(buffer, &map, GST_MAP_READ);
 
   // Allocate appropriate buffer to store compressed image
-  //char pRet[map.size];
   if(pRet){
     free(pRet);
   }
@@ -171,12 +145,6 @@ void *PullBuffer() {
 
   gst_buffer_unmap(buffer, &map);
   gst_sample_unref(sample);
-
-  // Inform caller of image size
-  //*outlen = map.size;
-
-  int stop = MyGetTickCount();
-  printf("%d\n",stop - t[j++]);
   
   fwrite(pRet, 1, map.size, of);
 
@@ -251,13 +219,13 @@ void *GstreamerThread(void *pThreadParam) {
     return (void *)0xDEAD;
   }
 
-  // appsrc should be linked to jpegenc with these caps otherwise jpegenc does
+  // appsrc should be linked to x264enc with these caps otherwise x264enc does
   // not know size of incoming buffer
   GstCaps *cap_appsrc_to_x264enc;
   cap_appsrc_to_x264enc =
-      gst_caps_new_simple("video/x-raw", "format", G_TYPE_STRING, "BGRx",
+      gst_caps_new_simple("video/x-raw", "format", G_TYPE_STRING, "BGR",
                           "width", G_TYPE_INT, width, "height", G_TYPE_INT,
-                          height, "framerate", GST_TYPE_FRACTION, 30, 1, NULL);
+                          height, "framerate", GST_TYPE_FRACTION, 60, 1, NULL);
 
   GstCaps *cap_x264enc_to_sink;
   cap_x264enc_to_sink = gst_caps_new_simple(
@@ -269,22 +237,19 @@ void *GstreamerThread(void *pThreadParam) {
   char szTemp[64];
   sprintf(szTemp, "%d", width * height);
   g_object_set(G_OBJECT(appsrc), "blocksize", szTemp, NULL);
-  g_object_set(G_OBJECT(x264enc), "sync-lookahead", 2, NULL);
-  g_object_set(G_OBJECT(x264enc), "rc-lookahead", 2, NULL);
+  g_object_set(G_OBJECT(x264enc), "sync-lookahead", 0, NULL);
+  g_object_set(G_OBJECT(x264enc), "rc-lookahead", 0, NULL);
   g_object_set(G_OBJECT(x264enc), "bframes", 0, NULL);
-  //g_object_set(G_OBJECT(x264enc), "speed-preset", "ultrafast", NULL);
-  g_object_set(G_OBJECT(x264enc), "key-int-max", 10, NULL);
-  g_object_set(G_OBJECT(x264enc), "bitrate", 3000, NULL);
-  
-
   g_object_set(G_OBJECT(appsrc), "stream-type", 0, "format", GST_FORMAT_TIME,
                NULL);
   g_object_set(G_OBJECT(appsrc), "caps",
                gst_caps_new_simple("video/x-raw", "format", G_TYPE_STRING,
-                                   "BGRx", "width", G_TYPE_INT, width,
+                                   "BGR", "width", G_TYPE_INT, width,
                                    "height", G_TYPE_INT, height, "framerate",
-                                   GST_TYPE_FRACTION, 30, 1, NULL),
+                                   GST_TYPE_FRACTION, 60, 1, NULL),
                NULL);
+
+  g_object_set(G_OBJECT(appsink), "sync", FALSE, NULL);
 
   // Create gstreamer loop
   loop = g_main_loop_new(NULL, False);
@@ -300,7 +265,7 @@ void *GstreamerThread(void *pThreadParam) {
   gst_element_link(vidconv, x264enc);
   gst_element_link_filtered(x264enc, appsink, cap_x264enc_to_sink);
 
-  //new~~~
+  //new signal thread~~~
   g_object_set(appsink, "emit-signals", TRUE, NULL);
   g_signal_connect(appsink, "new-sample", G_CALLBACK(NewSample), NULL);
 
@@ -338,21 +303,11 @@ void *GstreamerThread(void *pThreadParam) {
 // Starts GstreamerThread that remains in memory and compresses frames as being
 // fed by user app.
 Bool StartGstreamer() {
-  // GstreamerThread(NULL);
-  // return True;
   unsigned long GtkThreadId;
   pthread_attr_t GtkAttr;
   int result;
 
-  // Start thread
-  // int result = pthread_attr_init(&GtkAttr);
-  // if (result != 0) {
-  //   fprintf(stderr, "pthread_attr_init returned error %d\n", result);
-  //   return False;
-  // }
-
   void *pParam = NULL;
-  //result = pthread_create(&GtkThreadId, &GtkAttr, GstreamerThread, pParam);
   result = pthread_create(&GtkThreadId,NULL,GstreamerThread,(void *)GtkThreadId);
   if (result != 0) {
     printf("pthread_create returned error %d\n", result);
@@ -373,10 +328,7 @@ int main(int argc, char *argv[]) {
 
   /* Check input arguments */
   if (argc < 2 || argc > 5) {
-    fprintf(stderr, "Usage: %s rawfile width height outfile [quality]\n"
-                    "Rawfile must be one raw frame of GRAY8, outfile will be "
-                    "JPG encoded. 10 outfiles will be created\n",
-            argv[0]);
+    fprintf(stderr, "Usage: %s width height\n",argv[0]);
     return -1;
   }
   /* Initialization */
@@ -385,26 +337,23 @@ int main(int argc, char *argv[]) {
   // Read command line arguments
   width = atoi(argv[1]);
   height = atoi(argv[2]);
-  //outfile = argv[3];
 
   // Validate command line arguments
   if (width < 100 || width > 4096 || height < 100 || height > 4096) {
-    printf("width and/or height or quality is bad, not running conversion\n");
+    printf("width and/or height is bad, not running conversion\n");
     return -1;
   }
 
-  of = fopen("/root/Desktop/h264_testout.mp4", "wb");
+  of = fopen("gstreamer_testout.mp4", "wb");
 
-  rawdata = malloc(width * height *4);
-  //memset(rawdata,0,width*height*3);
+  rawdata = malloc(width * height *3);
 
   // Init raw frame
-  srand(time(NULL));
   for (int i = 0; i < width * height; ++i) {
-    rawdata[i*3] = rand() % 255;     //R
-    rawdata[i*3+1] = rand() % 255;   //G
-    rawdata[i*3+2] = rand() % 255;   //B
-    rawdata[i*4+3] = rand() % 255;   //x
+    rawdata[i*3] = (i*3) % 255;     //R
+    rawdata[i*3+1] = (i*3+1) % 255;   //G
+    rawdata[i*3+2] = (i*3+2) % 255;   //B
+    //rawdata[i*4+3] = 255;                  //A
   }
 
   // Start conversion thread
@@ -420,23 +369,18 @@ int main(int argc, char *argv[]) {
 
   int ticks = MyGetTickCount();
 
-  //FILE *of = fopen("/root/Desktop/testout.mp4", "wb");
   // Compress raw frame 10 times, adding horizontal stripes to ensure resulting
   // images are different
-  for (int i = 0; i < 150; i++) {
+  for (int i = 0; i < 100; i++) {
     // write stripes into image to see they are really different
-    // memset(rawdata + (i * 2) * width * 3, 0xff, width*3);
-    // memset(rawdata + ((i + 3) * 2) * width * 3, 0x00, width*3);
+    memset(rawdata + (i) * width * 3, 0xff, width*3);
+    memset(rawdata + ((i) * 2) * width * 3, 0x00, width*3);
 
-    // Push raw buffer into gstreamer
-    //memset(rawdata,i,width*height*3);
     PushBuffer();
-    usleep(1000000/30);
   }
 
   // Get total conversion time
   int ms = MyGetTickCount() - ticks;
-
 
   // Wait until GstreamerThread stops
   for (int i = 0; i < 100000; i++) {
